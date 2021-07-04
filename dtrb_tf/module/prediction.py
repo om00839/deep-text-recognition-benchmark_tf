@@ -1,32 +1,34 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 import tensorflow as tf
 from tensorflow import keras as K
 from tensorflow.keras import layers as L
 
-#TODO 포팅 시작
 
-
-class Attention(nn.Module):
+class Attention(K.Model):
 
     def __init__(self, input_size, hidden_size, num_classes):
         super(Attention, self).__init__()
         self.attention_cell = AttentionCell(input_size, hidden_size, num_classes)
         self.hidden_size = hidden_size
         self.num_classes = num_classes
-        self.generator = nn.Linear(hidden_size, num_classes)
+        self.generator = L.Dense(num_classes)
 
     def _char_to_onehot(self, input_char, onehot_dim=38):
-        input_char = input_char.unsqueeze(1)
-        batch_size = input_char.size(0)
-        one_hot = torch.FloatTensor(batch_size, onehot_dim).zero_().to(device)
-        one_hot = one_hot.scatter_(1, input_char, 1)
+        input_char = tf.expand_dims(input_char, 1)
+        batch_size = input_char.shape[0]
+        # TODO: 확인필요
+        one_hot = tf.one_hot(input_char, onehot_dim, dtype=tf.float32)
+        one_hot = tf.tile(one_hot, [batch_size, 0, 0])
+        # pytorch version
+        # one_hot = tf.zeros([batch_size, onehot_dim], dtype=tf.float32)
+        # one_hot = one_hot.scatter_(1, input_char, 1)
         return one_hot
 
-    def forward(self, batch_H, text, is_train=True, batch_max_length=25):
+    def call(self, batch_H, text, is_train=True, batch_max_length=25):
         """
         input:
             batch_H : contextual_feature H = hidden state of encoder. [batch_size x num_steps x contextual_feature_channels]
@@ -36,9 +38,14 @@ class Attention(nn.Module):
         batch_size = batch_H.size(0)
         num_steps = batch_max_length + 1  # +1 for [s] at end of sentence.
 
-        output_hiddens = torch.FloatTensor(batch_size, num_steps, self.hidden_size).fill_(0).to(device)
-        hidden = (torch.FloatTensor(batch_size, self.hidden_size).fill_(0).to(device),
-                  torch.FloatTensor(batch_size, self.hidden_size).fill_(0).to(device))
+        output_hiddens = tf.zeros([batch_size, num_steps, self.hidden_size], dtype=tf.float32)
+        # output_hiddens = torch.FloatTensor(batch_size, num_steps, self.hidden_size).fill_(0).to(device)
+        hidden = (
+            tf.zeros([batch_size, self.hidden_size], dtype=tf.float32),
+            tf.zeros([batch_size, self.hidden_size], dtype=tf.float32)
+        )
+        # hidden = (torch.FloatTensor(batch_size, self.hidden_size).fill_(0).to(device),
+        #           torch.FloatTensor(batch_size, self.hidden_size).fill_(0).to(device))
 
         if is_train:
             for i in range(num_steps):
@@ -50,8 +57,10 @@ class Attention(nn.Module):
             probs = self.generator(output_hiddens)
 
         else:
-            targets = torch.LongTensor(batch_size).fill_(0).to(device)  # [GO] token
-            probs = torch.FloatTensor(batch_size, num_steps, self.num_classes).fill_(0).to(device)
+            targets = tf.zeros(batch_size, dtype=tf.float64)
+            # targets = torch.LongTensor(batch_size).fill_(0).to(device)  # [GO] token
+            probs = tf.zeros([batch_size, num_steps, self.num_classes], dtype=tf.float32)
+            # probs = torch.FloatTensor(batch_size, num_steps, self.num_classes).fill_(0).to(device)
 
             for i in range(num_steps):
                 char_onehots = self._char_to_onehot(targets, onehot_dim=self.num_classes)
@@ -64,24 +73,26 @@ class Attention(nn.Module):
         return probs  # batch_size x num_steps x num_classes
 
 
-class AttentionCell(nn.Module):
+class AttentionCell(K.Model):
 
     def __init__(self, input_size, hidden_size, num_embeddings):
         super(AttentionCell, self).__init__()
-        self.i2h = nn.Linear(input_size, hidden_size, bias=False)
-        self.h2h = nn.Linear(hidden_size, hidden_size)  # either i2i or h2h should have bias
-        self.score = nn.Linear(hidden_size, 1, bias=False)
-        self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
+        self.i2h = L.Dense(hidden_size, use_bias=False)
+        self.h2h = L.Dense(hidden_size)  # either i2i or h2h should have bias
+        self.score = L.Dense(1, use_bias=False)
+        
+        self.rnn = L.LSTMCell(hidden_size) # input shape: (input_size + num_embeddings)
         self.hidden_size = hidden_size
 
-    def forward(self, prev_hidden, batch_H, char_onehots):
+    def call(self, prev_hidden, batch_H, char_onehots):
         # [batch_size x num_encoder_step x num_channel] -> [batch_size x num_encoder_step x hidden_size]
         batch_H_proj = self.i2h(batch_H)
         prev_hidden_proj = self.h2h(prev_hidden[0]).unsqueeze(1)
-        e = self.score(torch.tanh(batch_H_proj + prev_hidden_proj))  # batch_size x num_encoder_step * 1
+        e = self.score(K.activations.tanh(batch_H_proj + prev_hidden_proj))  # batch_size x num_encoder_step * 1
 
-        alpha = F.softmax(e, dim=1)
-        context = torch.bmm(alpha.permute(0, 2, 1), batch_H).squeeze(1)  # batch_size x num_channel
-        concat_context = torch.cat([context, char_onehots], 1)  # batch_size x (num_channel + num_embedding)
+        alpha = K.activations.softmax(e, dim=1)
+        context = tf.linalg.matmul(tf.transpose(alpha, perm=[0, 2, 1]), batch_H)
+        context = tf.squeeze(context, 1)  # batch_size x num_channel
+        concat_context = tf.concat([context, char_onehots], 1)  # batch_size x (num_channel + num_embedding)
         cur_hidden = self.rnn(concat_context, prev_hidden)
         return cur_hidden, alpha
